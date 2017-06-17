@@ -17,13 +17,18 @@
 package ethdb
 
 import (
-	"errors"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
-	"ustore"
 
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/metrics"
+	"github.com/syndtr/goleveldb/leveldb"
+	"github.com/syndtr/goleveldb/leveldb/errors"
+	"github.com/syndtr/goleveldb/leveldb/filter"
+	"github.com/syndtr/goleveldb/leveldb/iterator"
+	"github.com/syndtr/goleveldb/leveldb/opt"
 
 	gometrics "github.com/rcrowley/go-metrics"
 )
@@ -32,7 +37,7 @@ var OpenFileLimit = 64
 
 type LDBDatabase struct {
 	fn string      // filename for reporting
-	db ustore.KVDB // ustore instance
+	db *leveldb.DB // LevelDB instance
 
 	getTimer       gometrics.Timer // Timer for measuring the database get request counts and latencies
 	putTimer       gometrics.Timer // Timer for measuring the database put request counts and latencies
@@ -63,23 +68,20 @@ func NewLDBDatabase(file string, cache int, handles int) (*LDBDatabase, error) {
 	}
 	logger.Info("Allocated cache and file handles", "cache", cache, "handles", handles)
 
-	db := ustore.NewKVDB()
-	/*
-		// Open the db and recover any potential corruptions
-		db, err := leveldb.OpenFile(file, &opt.Options{
-			OpenFilesCacheCapacity: handles,
-			BlockCacheCapacity:     cache / 2 * opt.MiB,
-			WriteBuffer:            cache / 4 * opt.MiB, // Two of these are used internally
-			Filter:                 filter.NewBloomFilter(10),
-		})
-		if _, corrupted := err.(*errors.ErrCorrupted); corrupted {
-			db, err = leveldb.RecoverFile(file, nil)
-		}
-		// (Re)check for errors and abort if opening of the db failed
-		if err != nil {
-			return nil, err
-		}
-	*/
+	// Open the db and recover any potential corruptions
+	db, err := leveldb.OpenFile(file, &opt.Options{
+		OpenFilesCacheCapacity: handles,
+		BlockCacheCapacity:     cache / 2 * opt.MiB,
+		WriteBuffer:            cache / 4 * opt.MiB, // Two of these are used internally
+		Filter:                 filter.NewBloomFilter(10),
+	})
+	if _, corrupted := err.(*errors.ErrCorrupted); corrupted {
+		db, err = leveldb.RecoverFile(file, nil)
+	}
+	// (Re)check for errors and abort if opening of the db failed
+	if err != nil {
+		return nil, err
+	}
 	return &LDBDatabase{
 		fn:  file,
 		db:  db,
@@ -104,11 +106,7 @@ func (db *LDBDatabase) Put(key []byte, value []byte) error {
 	if db.writeMeter != nil {
 		db.writeMeter.Mark(int64(len(value)))
 	}
-	st := db.db.Put(string(key), string(value))
-	if !st.Ok() {
-		return errors.New(st.ToString())
-	}
-	return nil
+	return db.db.Put(key, value, nil)
 }
 
 // Get returns the given key if it's present.
@@ -117,16 +115,8 @@ func (db *LDBDatabase) Get(key []byte) ([]byte, error) {
 	if db.getTimer != nil {
 		defer db.getTimer.UpdateSince(time.Now())
 	}
-	ret := db.db.Get(string(key))
-	st := ret.GetFirst()
-	dat := []byte(ret.GetSecond())
-	err := errors.New("")
-	err = nil
-	if st.IsNotFound() {
-		dat = nil
-	} else if !st.Ok() {
-		err = errors.New(st.ToString())
-	}
+	// Retrieve the key and increment the miss counter if not found
+	dat, err := db.db.Get(key, nil)
 	if err != nil {
 		if db.missMeter != nil {
 			db.missMeter.Mark(1)
@@ -138,6 +128,7 @@ func (db *LDBDatabase) Get(key []byte) ([]byte, error) {
 		db.readMeter.Mark(int64(len(dat)))
 	}
 	return dat, nil
+	//return rle.Decompress(dat)
 }
 
 // Delete deletes the key from the queue and database
@@ -147,17 +138,11 @@ func (db *LDBDatabase) Delete(key []byte) error {
 		defer db.delTimer.UpdateSince(time.Now())
 	}
 	// Execute the actual operation
-	st := db.db.Delete(string(key))
-	if !st.Ok() {
-		return errors.New(st.ToString())
-	}
-	return nil
+	return db.db.Delete(key, nil)
 }
 
-func (db *LDBDatabase) NewIterator() ustore.Iterator {
-	it := db.db.NewIterator()
-	it.SeekToFirst()
-	return it
+func (db *LDBDatabase) NewIterator() iterator.Iterator {
+	return db.db.NewIterator(nil, nil)
 }
 
 func (db *LDBDatabase) Close() {
@@ -172,11 +157,15 @@ func (db *LDBDatabase) Close() {
 			db.log.Error("Metrics collection failed", "err", err)
 		}
 	}
-	ustore.DeleteKVDB(db.db)
-	db.log.Info("Database closed")
+	err := db.db.Close()
+	if err == nil {
+		db.log.Info("Database closed")
+	} else {
+		db.log.Error("Failed to close database", "err", err)
+	}
 }
 
-func (db *LDBDatabase) LDB() ustore.KVDB {
+func (db *LDBDatabase) LDB() *leveldb.DB {
 	return db.db
 }
 
@@ -217,30 +206,89 @@ func (db *LDBDatabase) Meter(prefix string) {
 //      2   |        523 |    1000.37159 |       7.26059 |      66.86342 |      66.77884
 //      3   |        570 |    1113.18458 |       0.00000 |       0.00000 |       0.00000
 func (db *LDBDatabase) meter(refresh time.Duration) {
+	// Create the counters to store current and previous values
+	counters := make([][]float64, 2)
+	for i := 0; i < 2; i++ {
+		counters[i] = make([]float64, 3)
+	}
+	// Iterate ad infinitum and collect the stats
+	for i := 1; ; i++ {
+		// Retrieve the database stats
+		stats, err := db.db.GetProperty("leveldb.stats")
+		if err != nil {
+			db.log.Error("Failed to read database stats", "err", err)
+			return
+		}
+		// Find the compaction table, skip the header
+		lines := strings.Split(stats, "\n")
+		for len(lines) > 0 && strings.TrimSpace(lines[0]) != "Compactions" {
+			lines = lines[1:]
+		}
+		if len(lines) <= 3 {
+			db.log.Error("Compaction table not found")
+			return
+		}
+		lines = lines[3:]
+
+		// Iterate over all the table rows, and accumulate the entries
+		for j := 0; j < len(counters[i%2]); j++ {
+			counters[i%2][j] = 0
+		}
+		for _, line := range lines {
+			parts := strings.Split(line, "|")
+			if len(parts) != 6 {
+				break
+			}
+			for idx, counter := range parts[3:] {
+				value, err := strconv.ParseFloat(strings.TrimSpace(counter), 64)
+				if err != nil {
+					db.log.Error("Compaction entry parsing failed", "err", err)
+					return
+				}
+				counters[i%2][idx] += value
+			}
+		}
+		// Update all the requested meters
+		if db.compTimeMeter != nil {
+			db.compTimeMeter.Mark(int64((counters[i%2][0] - counters[(i-1)%2][0]) * 1000 * 1000 * 1000))
+		}
+		if db.compReadMeter != nil {
+			db.compReadMeter.Mark(int64((counters[i%2][1] - counters[(i-1)%2][1]) * 1024 * 1024))
+		}
+		if db.compWriteMeter != nil {
+			db.compWriteMeter.Mark(int64((counters[i%2][2] - counters[(i-1)%2][2]) * 1024 * 1024))
+		}
+		// Sleep a bit, then repeat the stats collection
+		select {
+		case errc := <-db.quitChan:
+			// Quit requesting, stop hammering the database
+			errc <- nil
+			return
+
+		case <-time.After(refresh):
+			// Timeout, gather a new set of stats
+		}
+	}
 }
 
 // TODO: remove this stuff and expose leveldb directly
 
 func (db *LDBDatabase) NewBatch() Batch {
-	b := ustore.NewWriteBatch()
-	return &ldbBatch{db: db.db, b: b}
+	return &ldbBatch{db: db.db, b: new(leveldb.Batch)}
 }
 
 type ldbBatch struct {
-	db ustore.KVDB
-	b  ustore.WriteBatch
+	db *leveldb.DB
+	b  *leveldb.Batch
 }
 
 func (b *ldbBatch) Put(key, value []byte) error {
-	b.b.Put(string(key), string(value))
+	b.b.Put(key, value)
 	return nil
 }
 
 func (b *ldbBatch) Write() error {
-	if st := b.db.Write(b.b); !st.Ok() {
-		return errors.New(st.ToString())
-	}
-	return nil
+	return b.db.Write(b.b, nil)
 }
 
 type table struct {

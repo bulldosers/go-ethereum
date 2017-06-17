@@ -22,6 +22,12 @@ fi
 GOPATH="$workspace"
 export GOPATH
 
+USTORE_PATH="/home/jingo/USTORE-REBORN"
+CGO_LDFLAGS="-L$USTORE_PATH/build/lib -lustore_kv"
+CGO_CPPFLAGS="-I$USTORE_PATH/include -I$USTORE_PATH/go/kvdb/include"
+export CGO_LDFLAGS
+export CGO_CPPFLAGS
+
 # Run the command inside the workspace.
 cd "$ethdir/go-ethereum"
 PWD="$ethdir/go-ethereum"

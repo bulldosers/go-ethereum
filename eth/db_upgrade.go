@@ -95,22 +95,22 @@ func upgradeSequentialCanonicalNumbers(db ethdb.Database, stopFn func() bool) (e
 	defer func() {
 		it.Release()
 	}()
-	it.Seek(prefix)
+	it.Seek(string(prefix))
 	cnt := 0
-	for bytes.HasPrefix(it.Key(), prefix) {
-		keyPtr := it.Key()
+	for bytes.HasPrefix([]byte(it.Key()), prefix) {
+		keyPtr := []byte(it.Key())
 		if len(keyPtr) < 20 {
 			cnt++
 			if cnt%100000 == 0 {
 				it.Release()
 				it = db.(*ethdb.LDBDatabase).NewIterator()
-				it.Seek(keyPtr)
+				it.Seek(string(keyPtr))
 				log.Info("Converting canonical numbers", "count", cnt)
 			}
 			number := big.NewInt(0).SetBytes(keyPtr[10:]).Uint64()
 			newKey := []byte("h12345678n")
 			binary.BigEndian.PutUint64(newKey[1:9], number)
-			if err := db.Put(newKey, it.Value()); err != nil {
+			if err := db.Put(newKey, []byte(it.Value())); err != nil {
 				return err, false
 			}
 			if err := db.Delete(keyPtr); err != nil {
@@ -138,9 +138,9 @@ func upgradeSequentialBlocks(db ethdb.Database, stopFn func() bool) (error, bool
 	defer func() {
 		it.Release()
 	}()
-	it.Seek(prefix)
+	it.Seek(string(prefix))
 	cnt := 0
-	for bytes.HasPrefix(it.Key(), prefix) {
+	for bytes.HasPrefix([]byte(it.Key()), prefix) {
 		keyPtr := it.Key()
 		if len(keyPtr) >= 38 {
 			cnt++
@@ -158,8 +158,8 @@ func upgradeSequentialBlocks(db ethdb.Database, stopFn func() bool) (error, bool
 				return err, false
 			}
 			// delete old db entries belonging to this hash
-			for bytes.HasPrefix(it.Key(), keyPrefix[:]) {
-				if err := db.Delete(it.Key()); err != nil {
+			for bytes.HasPrefix([]byte(it.Key()), keyPrefix[:]) {
+				if err := db.Delete([]byte(it.Key())); err != nil {
 					return err, false
 				}
 				it.Next()
@@ -187,13 +187,13 @@ func upgradeSequentialOrphanedReceipts(db ethdb.Database, stopFn func() bool) (e
 	prefix := []byte("receipts-block-")
 	it := db.(*ethdb.LDBDatabase).NewIterator()
 	defer it.Release()
-	it.Seek(prefix)
+	it.Seek(string(prefix))
 	cnt := 0
-	for bytes.HasPrefix(it.Key(), prefix) {
+	for bytes.HasPrefix([]byte(it.Key()), prefix) {
 		// phase 2 already converted receipts belonging to existing
 		// blocks, just remove if there's anything left
 		cnt++
-		if err := db.Delete(it.Key()); err != nil {
+		if err := db.Delete([]byte(it.Key())); err != nil {
 			return err, false
 		}
 
